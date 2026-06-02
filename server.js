@@ -193,18 +193,9 @@ app.post('/api/presupuesto-excel', async (req, res) => {
     xml = setNum(xml, 'C9',  excelDate);     // Fecha
     xml = setStr(xml, 'N6',  clienteExcel);  // Particular/empresa → IVA
     xml = setStr(xml, 'N7',  tarifaExcel);   // Tarifa
-
-    // Forzar "ajustar a 1 página de ancho" (en vez de escala fija al 73%, que se
-    // desborda a páginas extra según la versión de LibreOffice). Así siempre 3 págs.
-    if (!/pageSetUpPr/.test(xml)) {
-      xml = xml.replace(/<sheetPr([^>]*?)\/>/, '<sheetPr$1><pageSetUpPr fitToPage="1"/></sheetPr>');
-    }
-    xml = xml.replace(/<pageSetup\b([^>]*?)\/>/, (m, a) => {
-      a = a.replace(/\s*scale="[^"]*"/, '')
-           .replace(/\s*fitToWidth="[^"]*"/, '')
-           .replace(/\s*fitToHeight="[^"]*"/, '');
-      return `<pageSetup${a} fitToWidth="1" fitToHeight="0"/>`;
-    });
+    // NOTA: se respeta el área de impresión y la escala del Excel de Toño tal cual
+    // (3 páginas). Las 3 páginas limpias dependen de tener la fuente Calibri/Carlito
+    // instalada en el contenedor (ver Dockerfile), no de modificar el pageSetup.
     zip.file('xl/worksheets/sheet1.xml', xml);
 
     // Ocultar hojas auxiliares (se necesitan para los cálculos, pero no deben

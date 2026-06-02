@@ -201,7 +201,7 @@ app.post('/api/presupuesto-excel', async (req, res) => {
 
   } catch (err) {
     console.error('Error generando PDF:', err);
-    if (!res.headersSent) res.status(500).json({ error: 'No se pudo generar el presupuesto.', debug: String(err && err.message || err) });
+    if (!res.headersSent) res.status(500).json({ error: 'No se pudo generar el presupuesto.' });
   } finally {
     fs.unlink(tmpXlsx, () => {});
     fs.unlink(tmpPdf,  () => {});

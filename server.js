@@ -89,22 +89,37 @@ async function geocodeAddress(address) {
 
 /* ── CONVERSIÓN XLSX → PDF con LibreOffice ───────────────────────────────── */
 
+// Crea un perfil de LibreOffice con recálculo automático al cargar (OOXML/ODF
+// RecalcMode=0 = "Siempre"). Sin esto, LibreOffice headless NO recalcula las
+// fórmulas y el PDF saldría con los valores cacheados (título/precio viejos).
+function makeLoProfile() {
+  const base = path.join(os.tmpdir(), 'lo_profile_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+  const userDir = path.join(base, 'user');
+  fs.mkdirSync(userDir, { recursive: true });
+  const xcu = `<?xml version="1.0" encoding="UTF-8"?>
+<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+ <item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="OOXMLRecalcMode" oor:op="fuse"><value>0</value></prop></item>
+ <item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="ODFRecalcMode" oor:op="fuse"><value>0</value></prop></item>
+</oor:items>`;
+  fs.writeFileSync(path.join(userDir, 'registrymodifications.xcu'), xcu);
+  return base;
+}
+
 function xlsxToPdf(xlsxBuffer, tmpXlsx, tmpPdf) {
   fs.writeFileSync(tmpXlsx, xlsxBuffer);
+  const profileBase = makeLoProfile();
+  const profileUrl  = 'file://' + profileBase.replace(/\\/g, '/').replace(/^([A-Za-z]:)/, '/$1');
   let loResult;
   if (process.platform === 'win32') {
     const soffice = 'C:\\Program Files\\LibreOffice\\program\\soffice.exe';
     loResult = spawnSync('powershell.exe',
-      ['-Command', `& '${soffice}' --headless --norestore --convert-to pdf --outdir '${os.tmpdir()}' '${tmpXlsx}'`],
-      { timeout: 50000, windowsHide: true });
+      ['-Command', `& '${soffice}' --headless --norestore '-env:UserInstallation=${profileUrl}' --convert-to pdf --outdir '${os.tmpdir()}' '${tmpXlsx}'`],
+      { timeout: 60000, windowsHide: true });
   } else {
-    // En Railway/Linux: dar a LibreOffice una carpeta de perfil escribible en /tmp,
-    // si no, no puede arrancar (HOME puede no ser escribible).
-    const profileDir = `file://${path.join(os.tmpdir(), 'lo_profile_' + Date.now())}`;
     loResult = spawnSync('soffice',
-      ['--headless','--norestore',`-env:UserInstallation=${profileDir}`,
+      ['--headless','--norestore',`-env:UserInstallation=${profileUrl}`,
        '--convert-to','pdf','--outdir', os.tmpdir(), tmpXlsx],
-      { timeout: 50000, env: { ...process.env, HOME: os.tmpdir() } });
+      { timeout: 60000, env: { ...process.env, HOME: os.tmpdir() } });
   }
   if (loResult.error)
     throw new Error(`LibreOffice no se pudo ejecutar: ${loResult.error.message}`);
@@ -130,12 +145,12 @@ app.post('/api/presupuesto-excel', async (req, res) => {
     const { kWp, numPaneles, consumo, cliente, tarifa, fase, bateria,
             address, lat, lng } = req.body;
 
-    const SS = { 'particular':16, 'empresa':37, 'no':7, '2.0 TD':134, '3.0 TD':22, '6.1 TD':140 };
-    const consumoVal = (consumo && consumo > 0) ? consumo : kWp * 1000;
-    const clienteIdx = cliente === 'empresa' ? SS['empresa'] : SS['particular'];
-    const tarifaIdx  = SS[tarifa] ?? SS['2.0 TD'];
-    const bateriaVal = bateria ? 1 : 0;
-    const excelDate  = Math.round(Date.now() / 86400000 + 25569);
+    const consumoVal   = (consumo && consumo > 0) ? consumo : kWp * 1000;
+    const bateriaVal   = bateria ? 1 : 0;
+    const excelDate    = Math.round(Date.now() / 86400000 + 25569);
+    const faseExcel    = (fase && /tri/i.test(fase)) ? 'trifásico' : 'monofásico';
+    const clienteExcel = (cliente && /empresa/i.test(cliente)) ? 'empresa' : 'particular';
+    const tarifaExcel  = tarifa || '2.0 TD';
 
     // Mapa satélite en paralelo con la preparación del xlsx
     const latNum = (lat !== null && lat !== undefined && lat !== '') ? parseFloat(lat) : NaN;
@@ -158,27 +173,41 @@ app.post('/api/presupuesto-excel', async (req, res) => {
     const srcData = fs.readFileSync(path.join(__dirname, 'exelhome.xlsx'));
     const zip = await JSZip.loadAsync(srcData);
 
-    const setNum = (x, ref, val) =>
-      x.replace(new RegExp(`(<c r="${ref}"[^>]*>(?:<f[^<]*</f>)?<v>)[^<]*(</v>)`), `$1${val}$2`);
-    const setSS  = (x, ref, idx) =>
-      x.replace(new RegExp(`(<c r="${ref}"[^>]*t="s"[^>]*>(?:<f[^<]*</f>)?<v>)[^<]*(</v>)`), `$1${idx}$2`);
+    // Escribe un valor en una celda de la hoja Factura, FORZÁNDOLO literal
+    // (elimina cualquier fórmula previa para que LibreOffice no la recalcule).
+    const cellRe = ref => new RegExp(`<c r="${ref}"((?:[^>]*?))(?:/>|>[\\s\\S]*?</c>)`);
+    const styleOf = attrs => ((/ s="\d+"/.exec(attrs) || [''])[0]);
+    const xmlEsc  = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const setNum  = (x, ref, val) => x.replace(cellRe(ref),
+      (m, attrs) => `<c r="${ref}"${styleOf(attrs)}><v>${val}</v></c>`);
+    const setStr  = (x, ref, str) => x.replace(cellRe(ref),
+      (m, attrs) => `<c r="${ref}"${styleOf(attrs)} t="inlineStr"><is><t xml:space="preserve">${xmlEsc(str)}</t></is></c>`);
 
+    // Hoja Factura (sheet1) — celdas de entrada confirmadas con Toño:
     let xml = await zip.file('xl/worksheets/sheet1.xml').async('string');
-    xml = setNum(xml, 'N8',  consumoVal);
-    xml = setNum(xml, 'I23', numPaneles);
-    xml = setNum(xml, 'I31', bateriaVal);
-    xml = setNum(xml, 'C9',  excelDate);
-    xml = setSS (xml, 'N6',  clienteIdx);
-    xml = setSS (xml, 'N7',  tarifaIdx);
+    xml = setNum(xml, 'N8',  consumoVal);    // Consumo kWh/año
+    xml = setNum(xml, 'N16', numPaneles);    // Nº paneles → título kWp + precio
+    xml = setNum(xml, 'N9',  kWp);           // Potencia inversor kW
+    xml = setStr(xml, 'O9',  faseExcel);     // monofásico / trifásico
+    xml = setNum(xml, 'I31', bateriaVal);    // Batería (0/1)
+    xml = setNum(xml, 'C9',  excelDate);     // Fecha
+    xml = setStr(xml, 'N6',  clienteExcel);  // Particular/empresa → IVA
+    xml = setStr(xml, 'N7',  tarifaExcel);   // Tarifa
     zip.file('xl/worksheets/sheet1.xml', xml);
 
+    // Ocultar hojas auxiliares (se necesitan para los cálculos, pero no deben
+    // imprimirse). Robusto: con o sin atributo state previo.
     let wbXml = await zip.file('xl/workbook.xml').async('string');
-    for (const sheetName of ['Datos partida', 'Calculos']) {
-      wbXml = wbXml.replace(
-        new RegExp(`(<sheet name="${sheetName}"[^>]*?)state="visible"`),
-        '$1state="veryHidden"'
+    for (const sheetName of ['Datos partida', 'Calculos', 'Hoja1']) {
+      wbXml = wbXml.replace(new RegExp(`<sheet name="${sheetName}"[^>]*?/>`), (tag) =>
+        /state="/.test(tag)
+          ? tag.replace(/state="[^"]*"/, 'state="veryHidden"')
+          : tag.replace(/\/>\s*$/, ' state="veryHidden"/>')
       );
     }
+    // Forzar recálculo completo al abrir (refuerzo del perfil de LibreOffice)
+    wbXml = wbXml.replace(/<calcPr([^>]*)\/>/, (m, a) =>
+      /fullCalcOnLoad/.test(a) ? m : `<calcPr${a} fullCalcOnLoad="1"/>`);
     zip.file('xl/workbook.xml', wbXml);
 
     const mapPngBuffer = await mapPromise;

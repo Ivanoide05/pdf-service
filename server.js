@@ -98,12 +98,18 @@ function xlsxToPdf(xlsxBuffer, tmpXlsx, tmpPdf) {
       ['-Command', `& '${soffice}' --headless --norestore --convert-to pdf --outdir '${os.tmpdir()}' '${tmpXlsx}'`],
       { timeout: 50000, windowsHide: true });
   } else {
+    // En Railway/Linux: dar a LibreOffice una carpeta de perfil escribible en /tmp,
+    // si no, no puede arrancar (HOME puede no ser escribible).
+    const profileDir = `file://${path.join(os.tmpdir(), 'lo_profile_' + Date.now())}`;
     loResult = spawnSync('soffice',
-      ['--headless','--norestore','--convert-to','pdf','--outdir', os.tmpdir(), tmpXlsx],
-      { timeout: 50000 });
+      ['--headless','--norestore',`-env:UserInstallation=${profileDir}`,
+       '--convert-to','pdf','--outdir', os.tmpdir(), tmpXlsx],
+      { timeout: 50000, env: { ...process.env, HOME: os.tmpdir() } });
   }
+  if (loResult.error)
+    throw new Error(`LibreOffice no se pudo ejecutar: ${loResult.error.message}`);
   if (loResult.status !== 0)
-    throw new Error(`LibreOffice status ${loResult.status}: ${(loResult.stderr||'').toString()}`);
+    throw new Error(`LibreOffice status ${loResult.status}: stderr=${(loResult.stderr||'').toString()} stdout=${(loResult.stdout||'').toString()}`);
   return fs.readFileSync(tmpPdf);
 }
 
@@ -195,7 +201,7 @@ app.post('/api/presupuesto-excel', async (req, res) => {
 
   } catch (err) {
     console.error('Error generando PDF:', err);
-    if (!res.headersSent) res.status(500).json({ error: 'No se pudo generar el presupuesto.' });
+    if (!res.headersSent) res.status(500).json({ error: 'No se pudo generar el presupuesto.', debug: String(err && err.message || err) });
   } finally {
     fs.unlink(tmpXlsx, () => {});
     fs.unlink(tmpPdf,  () => {});

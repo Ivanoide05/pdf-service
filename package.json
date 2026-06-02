@@ -1,0 +1,14 @@
+{
+  "name": "pdf-service",
+  "version": "1.0.0",
+  "description": "Microservicio de generacion de PDF (LibreOffice) para Autoconsumo Economico",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.22.2",
+    "jszip": "^3.10.1",
+    "jimp": "^0.22.12"
+  }
+}

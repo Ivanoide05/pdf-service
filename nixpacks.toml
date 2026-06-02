@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["nodejs_22", "libreoffice-unwrapped", "fontconfig", "freetype"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[start]
+cmd = "node server.js"

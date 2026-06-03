@@ -128,6 +128,82 @@ function xlsxToPdf(xlsxBuffer, tmpXlsx, tmpPdf) {
   return fs.readFileSync(tmpPdf);
 }
 
+// Aplana los rellenos de degradado de los gráficos a color sólido (solo para
+// LibreOffice, que los pinta negros). Devuelve un nuevo buffer xlsx.
+async function degradeChartsToSolid(xlsxBuffer) {
+  const z = await JSZip.loadAsync(xlsxBuffer);
+  const charts = Object.keys(z.files).filter(f => /^xl\/charts\/chart\d+\.xml$/.test(f));
+  for (const cf of charts) {
+    let cxml = await z.file(cf).async('string');
+    cxml = cxml.replace(/<a:gradFill[\s\S]*?<\/a:gradFill>/g, (g) => {
+      const gs = g.match(/<a:gs\b[^>]*>([\s\S]*?)<\/a:gs>/);
+      return `<a:solidFill>${gs ? gs[1] : '<a:srgbClr val="4472C4"/>'}</a:solidFill>`;
+    });
+    z.file(cf, cxml);
+  }
+  return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+/* ── CONVERSIÓN XLSX → PDF con Aspose.Cells Cloud (alta fidelidad) ──────────
+   Aspose NO recalcula en la conversión directa, así que usamos el flujo con
+   almacenamiento: subir → CalculateFormula → convertir a PDF → borrar.        */
+
+function asposeRequest(method, urlStr, token, bodyBuffer, contentType) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const headers = {};
+    if (token)       headers['Authorization']  = 'Bearer ' + token;
+    if (contentType) headers['Content-Type']   = contentType;
+    headers['Content-Length'] = bodyBuffer ? bodyBuffer.length : 0;
+    const req = https.request(
+      { hostname: u.hostname, path: u.pathname + u.search, method, headers },
+      (r) => {
+        const chunks = [];
+        r.on('data', c => chunks.push(c));
+        r.on('end', () => resolve({
+          status: r.statusCode,
+          body: Buffer.concat(chunks),
+          contentType: r.headers['content-type'] || ''
+        }));
+        r.on('error', reject);
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('Timeout Aspose ' + method)); });
+    if (bodyBuffer) req.write(bodyBuffer);
+    req.end();
+  });
+}
+
+let asposeTokenCache = { token: null, exp: 0 };
+async function asposeGetToken(id, secret) {
+  if (asposeTokenCache.token && Date.now() < asposeTokenCache.exp) return asposeTokenCache.token;
+  const body = Buffer.from(`grant_type=client_credentials&client_id=${id}&client_secret=${secret}`);
+  const res = await asposeRequest('POST', 'https://api.aspose.cloud/connect/token', null, body, 'application/x-www-form-urlencoded');
+  if (res.status !== 200) throw new Error(`Aspose token ${res.status}: ${res.body.toString().slice(0,200)}`);
+  const data = JSON.parse(res.body.toString());
+  asposeTokenCache = { token: data.access_token, exp: Date.now() + ((data.expires_in || 3600) - 60) * 1000 };
+  return data.access_token;
+}
+
+async function convertWithAspose(xlsxBuffer, id, secret) {
+  const token = await asposeGetToken(id, secret);
+  const name  = `pres_${Date.now()}_${Math.random().toString(36).slice(2)}.xlsx`;
+  const base  = 'https://api.aspose.cloud/v3.0/cells';
+  try {
+    let r = await asposeRequest('PUT', `${base}/storage/file/${name}`, token, xlsxBuffer, 'application/octet-stream');
+    if (r.status !== 200) throw new Error(`Aspose upload ${r.status}: ${r.body.toString().slice(0,200)}`);
+    r = await asposeRequest('POST', `${base}/${name}/calculateformula`, token, null);
+    if (r.status !== 200) throw new Error(`Aspose calculate ${r.status}: ${r.body.toString().slice(0,200)}`);
+    r = await asposeRequest('GET', `${base}/${name}?format=pdf`, token, null);
+    if (r.status !== 200 || !r.contentType.includes('pdf'))
+      throw new Error(`Aspose convert ${r.status}: ${r.body.toString().slice(0,200)}`);
+    return r.body;
+  } finally {
+    asposeRequest('DELETE', `${base}/storage/file/${name}`, token, null).catch(() => {});
+  }
+}
+
 /* ── EXPRESS ─────────────────────────────────────────────────────────────── */
 
 app.use(express.json({ limit: '50mb' }));
@@ -229,30 +305,30 @@ app.post('/api/presupuesto-excel', async (req, res) => {
       /fullCalcOnLoad/.test(a) ? m : `<calcPr${a} fullCalcOnLoad="1"/>`);
     zip.file('xl/workbook.xml', wbXml);
 
-    // Convertir los rellenos de DEGRADADO de los gráficos a color sólido (su color
-    // dominante). LibreOffice headless dibuja los degradados como cuadros negros;
-    // con sólido se ven bien y se respeta el color elegido en el Excel.
-    const chartFiles = Object.keys(zip.files).filter(f => /^xl\/charts\/chart\d+\.xml$/.test(f));
-    for (const cf of chartFiles) {
-      let cxml = await zip.file(cf).async('string');
-      cxml = cxml.replace(/<a:gradFill[\s\S]*?<\/a:gradFill>/g, (g) => {
-        const gs = g.match(/<a:gs\b[^>]*>([\s\S]*?)<\/a:gs>/); // primer punto del degradado
-        const color = gs ? gs[1] : '<a:srgbClr val="4472C4"/>';
-        return `<a:solidFill>${color}</a:solidFill>`;
-      });
-      zip.file(cf, cxml);
-    }
-
     const mapPngBuffer = await mapPromise;
     if (mapPngBuffer) {
       zip.file('xl/media/image1.png', mapPngBuffer);
       console.log('[MAPA] image1.png sustituida en xlsx');
     }
 
+    // xlsx con los gráficos INTACTOS (degradados incluidos). Aspose los dibuja bien;
+    // para LibreOffice se aplanan a sólido justo antes de convertir.
     const xlsxBuf = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
 
-    console.log('[PDF] Convirtiendo con LibreOffice...');
-    const pdfBytes = xlsxToPdf(xlsxBuf, tmpXlsx, tmpPdf);
+    const useAspose = !!(process.env.ASPOSE_CLIENT_ID && process.env.ASPOSE_CLIENT_SECRET);
+    let pdfBytes;
+    if (useAspose) {
+      console.log('[PDF] Convirtiendo con Aspose (recálculo + gráficos fieles)...');
+      try {
+        pdfBytes = await convertWithAspose(xlsxBuf, process.env.ASPOSE_CLIENT_ID, process.env.ASPOSE_CLIENT_SECRET);
+      } catch (aspErr) {
+        console.error('[PDF] Aspose falló, respaldo LibreOffice:', aspErr.message);
+        pdfBytes = xlsxToPdf(await degradeChartsToSolid(xlsxBuf), tmpXlsx, tmpPdf);
+      }
+    } else {
+      console.log('[PDF] Convirtiendo con LibreOffice...');
+      pdfBytes = xlsxToPdf(await degradeChartsToSolid(xlsxBuf), tmpXlsx, tmpPdf);
+    }
     console.log('[PDF] PDF generado:', pdfBytes.length, 'bytes');
 
     const nombre = `Presupuesto_Fotovoltaico_${kWp}kWp.pdf`;

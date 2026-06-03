@@ -204,6 +204,132 @@ async function convertWithAspose(xlsxBuffer, id, secret) {
   }
 }
 
+/* ── INYECCIÓN DE DATOS EN LA HOJA FACTURA Y LECTURA DE RESULTADOS ─────────── */
+
+const _cellRe   = ref => new RegExp(`<c r="${ref}"((?:[^>]*?))(?:/>|>[\\s\\S]*?</c>)`);
+const _styleOf  = attrs => ((/ s="\d+"/.exec(attrs) || [''])[0]);
+const _xmlEsc   = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const _colNum   = c => { let n = 0; for (const ch of c) n = n * 26 + (ch.charCodeAt(0) - 64); return n; };
+const _setNum   = (x, ref, val) => x.replace(_cellRe(ref), (m, a) => `<c r="${ref}"${_styleOf(a)}><v>${val}</v></c>`);
+const _setStr   = (x, ref, str) => x.replace(_cellRe(ref), (m, a) => `<c r="${ref}"${_styleOf(a)} t="inlineStr"><is><t xml:space="preserve">${_xmlEsc(str)}</t></is></c>`);
+// Como _setNum pero inserta la celda si no existe (P9 y M16 vienen vacías).
+const _setCellNum = (x, ref, val) => {
+  if (_cellRe(ref).test(x)) return _setNum(x, ref, val);
+  const [, col, row] = ref.match(/^([A-Z]+)(\d+)$/);
+  const rowRe = new RegExp(`(<row r="${row}"[^>]*>)([\\s\\S]*?)(</row>)`);
+  return x.replace(rowRe, (m, open, body, close) => {
+    const newCell = `<c r="${ref}"><v>${val}</v></c>`;
+    let insertAt = body.length;
+    for (const cm of body.matchAll(/<c r="([A-Z]+)\d+"[\s\S]*?(?:\/>|<\/c>)/g)) {
+      if (_colNum(cm[1]) > _colNum(col)) { insertAt = cm.index; break; }
+    }
+    return open + body.slice(0, insertAt) + newCell + body.slice(insertAt) + close;
+  });
+};
+
+// Normaliza los datos del formulario a los valores que espera el Excel.
+function normalizeInputs(body) {
+  const { kWp, numPaneles, consumo, cliente, tarifa, fase, bateria, estructura } = body;
+  return {
+    kWp, numPaneles,
+    consumoVal:     (consumo && consumo > 0) ? consumo : kWp * 1000,
+    bateriaVal:     bateria ? 1 : 0,
+    excelDate:      Math.round(Date.now() / 86400000 + 25569),
+    faseExcel:      (fase && /tri/i.test(fase)) ? 'trifásico' : 'monofásico',
+    clienteExcel:   (cliente && /empresa/i.test(cliente)) ? 'empresa' : 'particular',
+    tarifaExcel:    tarifa || '2.0 TD',
+    estructuraExcel:(estructura === 'inclinada/solarblocs') ? 'inclinada/solarblocs' : 'coplanar'
+  };
+}
+
+// Escribe los datos en la hoja Factura (sheet1) de un zip ya cargado.
+async function injectInputs(zip, v) {
+  let xml = await zip.file('xl/worksheets/sheet1.xml').async('string');
+  xml = _setNum(xml, 'N8',  v.consumoVal);       // Consumo kWh/año
+  xml = _setCellNum(xml, 'M16', v.numPaneles);   // Nº paneles → título kWp + precio
+  xml = _setCellNum(xml, 'P9',  v.kWp);          // Potencia inversor kW
+  xml = _setStr(xml, 'O9',  v.faseExcel);        // monofásico / trifásico
+  xml = _setStr(xml, 'O12', v.estructuraExcel);  // coplanar / inclinada-solarblocs
+  xml = _setNum(xml, 'I31', v.bateriaVal);       // Batería (0/1)
+  xml = _setNum(xml, 'C9',  v.excelDate);        // Fecha
+  xml = _setStr(xml, 'N6',  v.clienteExcel);     // Particular/empresa → IVA
+  xml = _setStr(xml, 'N7',  v.tarifaExcel);      // Tarifa
+  zip.file('xl/worksheets/sheet1.xml', xml);
+}
+
+// Recalcula un xlsx con LibreOffice (convierte a xlsx con el perfil de recálculo)
+// y devuelve el buffer recalculado. Gratis y sin Aspose.
+function recalcXlsx(xlsxBuffer, tmpIn, outDir) {
+  fs.writeFileSync(tmpIn, xlsxBuffer);
+  const profileBase = makeLoProfile();
+  const profileUrl  = 'file://' + profileBase.replace(/\\/g, '/').replace(/^([A-Za-z]:)/, '/$1');
+  let r;
+  if (process.platform === 'win32') {
+    const soffice = 'C:\\Program Files\\LibreOffice\\program\\soffice.exe';
+    r = spawnSync('powershell.exe',
+      ['-Command', `& '${soffice}' --headless --norestore '-env:UserInstallation=${profileUrl}' --convert-to xlsx --outdir '${outDir}' '${tmpIn}'`],
+      { timeout: 60000, windowsHide: true });
+  } else {
+    r = spawnSync('soffice',
+      ['--headless','--norestore',`-env:UserInstallation=${profileUrl}`,'--convert-to','xlsx','--outdir', outDir, tmpIn],
+      { timeout: 60000, env: { ...process.env, HOME: os.tmpdir() } });
+  }
+  if (r.error)      throw new Error(`LibreOffice (recalc) no se pudo ejecutar: ${r.error.message}`);
+  if (r.status !== 0) throw new Error(`LibreOffice (recalc) status ${r.status}: ${(r.stderr||'').toString()}`);
+  const outFile = path.join(outDir, path.basename(tmpIn));
+  return fs.readFileSync(outFile);
+}
+
+// Lee valores de celdas (resueltos) de un xlsx recalculado.
+async function readCells(xlsxBuffer, refs) {
+  const zip = await JSZip.loadAsync(xlsxBuffer);
+  const sst = [];
+  const ssx = zip.file('xl/sharedStrings.xml');
+  if (ssx) { const t = await ssx.async('string');
+    for (const m of t.matchAll(/<si>([\s\S]*?)<\/si>/g))
+      sst.push([...m[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(x => x[1]).join('')); }
+  const cache = {};
+  const result = {};
+  for (const { key, sheet, ref } of refs) {
+    if (!cache[sheet]) cache[sheet] = await zip.file(sheet).async('string');
+    const m = cache[sheet].match(new RegExp(`<c r="${ref}"([^>]*)>(?:<f[^>]*>[\\s\\S]*?<\\/f>)?(?:<v>([\\s\\S]*?)<\\/v>|<is>([\\s\\S]*?)<\\/is>)<\\/c>`));
+    let val = null;
+    if (m) {
+      if (/t="s"/.test(m[1])) val = sst[+m[2]];
+      else if (m[3] !== undefined) val = [...m[3].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(x => x[1]).join('');
+      else val = parseFloat(m[2]);
+    }
+    result[key] = val;
+  }
+  return result;
+}
+
+// Localiza la imagen del MAPA dentro del xlsx (la PNG más grande del dibujo de la
+// hoja Factura). El número de imagen cambia según la plantilla, así que NO se puede
+// asumir image1.png; hay que detectarla.
+async function findMapImagePath(zip) {
+  try {
+    const sheetRels = zip.file('xl/worksheets/_rels/sheet1.xml.rels');
+    if (!sheetRels) return null;
+    const rx = await sheetRels.async('string');
+    const dm = rx.match(/Target="([^"]*drawings\/drawing\d+\.xml)"/);
+    if (!dm) return null;
+    const drawingName = dm[1].split('/').pop();
+    const drawRels = zip.file(`xl/drawings/_rels/${drawingName}.rels`);
+    if (!drawRels) return null;
+    const drx = await drawRels.async('string');
+    const pngs = [...drx.matchAll(/Target="([^"]+\.png)"/gi)].map(m => m[1].replace(/^\.\.\//, 'xl/'));
+    let best = null, bestSize = -1;
+    for (const p of pngs) {
+      const f = zip.file(p);
+      if (!f) continue;
+      const b = await f.async('nodebuffer');
+      if (b.length > bestSize) { bestSize = b.length; best = p; }
+    }
+    return best;
+  } catch { return null; }
+}
+
 /* ── EXPRESS ─────────────────────────────────────────────────────────────── */
 
 app.use(express.json({ limit: '50mb' }));
@@ -218,15 +344,8 @@ app.post('/api/presupuesto-excel', async (req, res) => {
   const tmpPdf  = path.join(tmpDir, `presupuesto_${ts}.pdf`);
 
   try {
-    const { kWp, numPaneles, consumo, cliente, tarifa, fase, bateria,
-            address, lat, lng } = req.body;
-
-    const consumoVal   = (consumo && consumo > 0) ? consumo : kWp * 1000;
-    const bateriaVal   = bateria ? 1 : 0;
-    const excelDate    = Math.round(Date.now() / 86400000 + 25569);
-    const faseExcel    = (fase && /tri/i.test(fase)) ? 'trifásico' : 'monofásico';
-    const clienteExcel = (cliente && /empresa/i.test(cliente)) ? 'empresa' : 'particular';
-    const tarifaExcel  = tarifa || '2.0 TD';
+    const { kWp, address, lat, lng } = req.body;
+    const v = normalizeInputs(req.body);
 
     // Mapa satélite en paralelo con la preparación del xlsx
     const latNum = (lat !== null && lat !== undefined && lat !== '') ? parseFloat(lat) : NaN;
@@ -249,46 +368,8 @@ app.post('/api/presupuesto-excel', async (req, res) => {
     const srcData = fs.readFileSync(path.join(__dirname, 'exelhome.xlsx'));
     const zip = await JSZip.loadAsync(srcData);
 
-    // Escribe un valor en una celda de la hoja Factura, FORZÁNDOLO literal
-    // (elimina cualquier fórmula previa para que LibreOffice no la recalcule).
-    const cellRe = ref => new RegExp(`<c r="${ref}"((?:[^>]*?))(?:/>|>[\\s\\S]*?</c>)`);
-    const styleOf = attrs => ((/ s="\d+"/.exec(attrs) || [''])[0]);
-    const xmlEsc  = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const colNum  = c => { let n = 0; for (const ch of c) n = n * 26 + (ch.charCodeAt(0) - 64); return n; };
-    const setNum  = (x, ref, val) => x.replace(cellRe(ref),
-      (m, attrs) => `<c r="${ref}"${styleOf(attrs)}><v>${val}</v></c>`);
-    const setStr  = (x, ref, str) => x.replace(cellRe(ref),
-      (m, attrs) => `<c r="${ref}"${styleOf(attrs)} t="inlineStr"><is><t xml:space="preserve">${xmlEsc(str)}</t></is></c>`);
-    // Como setNum, pero si la celda NO existe en el XML, la INSERTA en su fila en orden
-    // de columna (necesario para P9 y M16, que vienen vacías en la plantilla).
-    const setCellNum = (x, ref, val) => {
-      if (cellRe(ref).test(x)) return setNum(x, ref, val);
-      const [, col, row] = ref.match(/^([A-Z]+)(\d+)$/);
-      const rowRe = new RegExp(`(<row r="${row}"[^>]*>)([\\s\\S]*?)(</row>)`);
-      return x.replace(rowRe, (m, open, body, close) => {
-        const newCell = `<c r="${ref}"><v>${val}</v></c>`;
-        let insertAt = body.length;
-        for (const cm of body.matchAll(/<c r="([A-Z]+)\d+"[\s\S]*?(?:\/>|<\/c>)/g)) {
-          if (colNum(cm[1]) > colNum(col)) { insertAt = cm.index; break; }
-        }
-        return open + body.slice(0, insertAt) + newCell + body.slice(insertAt) + close;
-      });
-    };
-
-    // Hoja Factura (sheet1) — celdas de entrada confirmadas con Toño:
-    let xml = await zip.file('xl/worksheets/sheet1.xml').async('string');
-    xml = setNum(xml, 'N8',  consumoVal);    // Consumo kWh/año
-    xml = setCellNum(xml, 'M16', numPaneles);// Nº paneles (override manual) → título kWp + precio
-    xml = setCellNum(xml, 'P9',  kWp);       // Potencia inversor kW (override manual)
-    xml = setStr(xml, 'O9',  faseExcel);     // monofásico / trifásico
-    xml = setNum(xml, 'I31', bateriaVal);    // Batería (0/1)
-    xml = setNum(xml, 'C9',  excelDate);     // Fecha
-    xml = setStr(xml, 'N6',  clienteExcel);  // Particular/empresa → IVA
-    xml = setStr(xml, 'N7',  tarifaExcel);   // Tarifa
-    // NOTA: se respeta el área de impresión y la escala del Excel de Toño tal cual
-    // (3 páginas). Las 3 páginas limpias dependen de tener la fuente Calibri/Carlito
-    // instalada en el contenedor (ver Dockerfile), no de modificar el pageSetup.
-    zip.file('xl/worksheets/sheet1.xml', xml);
+    // Inyectar los datos del formulario en la hoja Factura (celdas de Toño).
+    await injectInputs(zip, v);
 
     // Ocultar hojas auxiliares (se necesitan para los cálculos, pero no deben
     // imprimirse). Robusto: con o sin atributo state previo.
@@ -307,8 +388,19 @@ app.post('/api/presupuesto-excel', async (req, res) => {
 
     const mapPngBuffer = await mapPromise;
     if (mapPngBuffer) {
-      zip.file('xl/media/image1.png', mapPngBuffer);
-      console.log('[MAPA] image1.png sustituida en xlsx');
+      const mapPath = (await findMapImagePath(zip)) || 'xl/media/image2.png';
+      zip.file(mapPath, mapPngBuffer);
+      console.log('[MAPA]', mapPath, 'sustituida en xlsx');
+    }
+
+    // Los gráficos toman sus datos de "Datos partida", que ocultamos para que el
+    // PDF salga en 3 páginas. Con plotVisOnly=1 no dibujarían (datos en hoja oculta)
+    // → curvas planas. Lo ponemos a 0 para que se dibujen igualmente.
+    const allCharts = Object.keys(zip.files).filter(f => /^xl\/charts\/chart\d+\.xml$/.test(f));
+    for (const cf of allCharts) {
+      let cxml = await zip.file(cf).async('string');
+      cxml = cxml.replace(/<c:plotVisOnly val="1"\/>/g, '<c:plotVisOnly val="0"/>');
+      zip.file(cf, cxml);
     }
 
     // xlsx con los gráficos INTACTOS (degradados incluidos). Aspose los dibuja bien;
@@ -343,6 +435,62 @@ app.post('/api/presupuesto-excel', async (req, res) => {
   } finally {
     fs.unlink(tmpXlsx, () => {});
     fs.unlink(tmpPdf,  () => {});
+  }
+});
+
+/* ── POST /api/calcular — números REALES del Excel para el panel de la web ───
+   Inyecta los datos, recalcula con LibreOffice (gratis) y devuelve los valores
+   exactos (precio, IRPF, neto, amortización, ahorro). Así la web = el PDF.      */
+app.post('/api/calcular', async (req, res) => {
+  const ts      = Date.now();
+  const tmpXlsx = path.join(os.tmpdir(), `calc_${ts}.xlsx`);
+  const outDir  = path.join(os.tmpdir(), `calcout_${ts}`);
+  try {
+    if (!req.body || !req.body.kWp || !req.body.numPaneles)
+      return res.status(400).json({ error: 'Faltan datos' });
+
+    const v = normalizeInputs(req.body);
+    const zip = await JSZip.loadAsync(fs.readFileSync(path.join(__dirname, 'exelhome.xlsx')));
+    await injectInputs(zip, v);
+    let wbXml = await zip.file('xl/workbook.xml').async('string');
+    wbXml = wbXml.replace(/<calcPr([^>]*)\/>/, (m, a) =>
+      /fullCalcOnLoad/.test(a) ? m : `<calcPr${a} fullCalcOnLoad="1"/>`);
+    zip.file('xl/workbook.xml', wbXml);
+    const xlsxBuf = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+
+    fs.mkdirSync(outDir, { recursive: true });
+    const recalced = recalcXlsx(xlsxBuf, tmpXlsx, outDir);
+
+    const F = 'xl/worksheets/sheet1.xml';     // Factura
+    const D = 'xl/worksheets/sheet2.xml';     // Datos partida
+    const c = await readCells(recalced, [
+      { key: 'precioConIva',  sheet: F, ref: 'I36' },
+      { key: 'base',          sheet: F, ref: 'J33' },
+      { key: 'iva',           sheet: F, ref: 'J34' },
+      { key: 'deduccionIRPF', sheet: F, ref: 'F37' },
+      { key: 'precioNeto',    sheet: F, ref: 'I40' },
+      { key: 'amortizacion',  sheet: D, ref: 'J13' },
+      { key: 'ahorroAnual',   sheet: D, ref: 'W87' }
+    ]);
+
+    const round = n => (typeof n === 'number' && isFinite(n)) ? Math.round(n) : null;
+    res.json({
+      precioConIva:  round(c.precioConIva),
+      base:          round(c.base),
+      iva:           round(c.iva),
+      deduccionIRPF: round(c.deduccionIRPF),
+      precioNeto:    round(c.precioNeto),
+      ahorroAnual:   round(c.ahorroAnual),
+      ahorroMensual: round((c.ahorroAnual || 0) / 12),
+      amortizacion:  (typeof c.amortizacion === 'number' && isFinite(c.amortizacion))
+                       ? Math.round(c.amortizacion) : null
+    });
+  } catch (err) {
+    console.error('Error en /api/calcular:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'No se pudo calcular.' });
+  } finally {
+    fs.unlink(tmpXlsx, () => {});
+    fs.rm(outDir, { recursive: true, force: true }, () => {});
   }
 });
 

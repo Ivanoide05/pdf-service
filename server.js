@@ -229,6 +229,20 @@ app.post('/api/presupuesto-excel', async (req, res) => {
       /fullCalcOnLoad/.test(a) ? m : `<calcPr${a} fullCalcOnLoad="1"/>`);
     zip.file('xl/workbook.xml', wbXml);
 
+    // Convertir los rellenos de DEGRADADO de los gráficos a color sólido (su color
+    // dominante). LibreOffice headless dibuja los degradados como cuadros negros;
+    // con sólido se ven bien y se respeta el color elegido en el Excel.
+    const chartFiles = Object.keys(zip.files).filter(f => /^xl\/charts\/chart\d+\.xml$/.test(f));
+    for (const cf of chartFiles) {
+      let cxml = await zip.file(cf).async('string');
+      cxml = cxml.replace(/<a:gradFill[\s\S]*?<\/a:gradFill>/g, (g) => {
+        const gs = g.match(/<a:gs\b[^>]*>([\s\S]*?)<\/a:gs>/); // primer punto del degradado
+        const color = gs ? gs[1] : '<a:srgbClr val="4472C4"/>';
+        return `<a:solidFill>${color}</a:solidFill>`;
+      });
+      zip.file(cf, cxml);
+    }
+
     const mapPngBuffer = await mapPromise;
     if (mapPngBuffer) {
       zip.file('xl/media/image1.png', mapPngBuffer);

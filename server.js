@@ -178,16 +178,32 @@ app.post('/api/presupuesto-excel', async (req, res) => {
     const cellRe = ref => new RegExp(`<c r="${ref}"((?:[^>]*?))(?:/>|>[\\s\\S]*?</c>)`);
     const styleOf = attrs => ((/ s="\d+"/.exec(attrs) || [''])[0]);
     const xmlEsc  = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const colNum  = c => { let n = 0; for (const ch of c) n = n * 26 + (ch.charCodeAt(0) - 64); return n; };
     const setNum  = (x, ref, val) => x.replace(cellRe(ref),
       (m, attrs) => `<c r="${ref}"${styleOf(attrs)}><v>${val}</v></c>`);
     const setStr  = (x, ref, str) => x.replace(cellRe(ref),
       (m, attrs) => `<c r="${ref}"${styleOf(attrs)} t="inlineStr"><is><t xml:space="preserve">${xmlEsc(str)}</t></is></c>`);
+    // Como setNum, pero si la celda NO existe en el XML, la INSERTA en su fila en orden
+    // de columna (necesario para P9 y M16, que vienen vacías en la plantilla).
+    const setCellNum = (x, ref, val) => {
+      if (cellRe(ref).test(x)) return setNum(x, ref, val);
+      const [, col, row] = ref.match(/^([A-Z]+)(\d+)$/);
+      const rowRe = new RegExp(`(<row r="${row}"[^>]*>)([\\s\\S]*?)(</row>)`);
+      return x.replace(rowRe, (m, open, body, close) => {
+        const newCell = `<c r="${ref}"><v>${val}</v></c>`;
+        let insertAt = body.length;
+        for (const cm of body.matchAll(/<c r="([A-Z]+)\d+"[\s\S]*?(?:\/>|<\/c>)/g)) {
+          if (colNum(cm[1]) > colNum(col)) { insertAt = cm.index; break; }
+        }
+        return open + body.slice(0, insertAt) + newCell + body.slice(insertAt) + close;
+      });
+    };
 
     // Hoja Factura (sheet1) — celdas de entrada confirmadas con Toño:
     let xml = await zip.file('xl/worksheets/sheet1.xml').async('string');
     xml = setNum(xml, 'N8',  consumoVal);    // Consumo kWh/año
-    xml = setNum(xml, 'N16', numPaneles);    // Nº paneles → título kWp + precio
-    xml = setNum(xml, 'N9',  kWp);           // Potencia inversor kW
+    xml = setCellNum(xml, 'M16', numPaneles);// Nº paneles (override manual) → título kWp + precio
+    xml = setCellNum(xml, 'P9',  kWp);       // Potencia inversor kW (override manual)
     xml = setStr(xml, 'O9',  faseExcel);     // monofásico / trifásico
     xml = setNum(xml, 'I31', bateriaVal);    // Batería (0/1)
     xml = setNum(xml, 'C9',  excelDate);     // Fecha

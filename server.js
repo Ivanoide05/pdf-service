@@ -189,18 +189,30 @@ async function asposeGetToken(id, secret) {
 async function convertWithAspose(xlsxBuffer, id, secret) {
   const token = await asposeGetToken(id, secret);
   const name  = `pres_${Date.now()}_${Math.random().toString(36).slice(2)}.xlsx`;
+  const out   = name.replace(/\.xlsx$/, '.pdf');
   const base  = 'https://api.aspose.cloud/v3.0/cells';
   try {
     let r = await asposeRequest('PUT', `${base}/storage/file/${name}`, token, xlsxBuffer, 'application/octet-stream');
     if (r.status !== 200) throw new Error(`Aspose upload ${r.status}: ${r.body.toString().slice(0,200)}`);
     r = await asposeRequest('POST', `${base}/${name}/calculateformula`, token, null);
     if (r.status !== 200) throw new Error(`Aspose calculate ${r.status}: ${r.body.toString().slice(0,200)}`);
-    r = await asposeRequest('GET', `${base}/${name}?format=pdf`, token, null);
-    if (r.status !== 200 || !r.contentType.includes('pdf'))
-      throw new Error(`Aspose convert ${r.status}: ${r.body.toString().slice(0,200)}`);
+    // Salto de página horizontal ANTES de la cabecera "Detalles técnicos" del mapa
+    // (celda A123) usando la API nativa de Aspose: los saltos del archivo .xlsx los
+    // IGNORA, pero este sí lo respeta → pág. 3 = cabecera + mapa juntos (no mapa huérfano).
+    r = await asposeRequest('PUT', `${base}/${name}/worksheets/Factura/horizontalpagebreaks?cellname=A123`, token, null);
+    if (r.status !== 200) console.warn(`[ASPOSE] salto de página A123 no aplicado (${r.status})`);
+    // SaveAs con PdfSaveOptions: OnePagePerSheet=false para que Aspose pagine por el
+    // page setup del Excel (scale 73% → 3 páginas A4) en vez de comprimir todo en 1.
+    const pdfOpts = Buffer.from(JSON.stringify({ SaveFormat: 'pdf', OnePagePerSheet: false }));
+    r = await asposeRequest('POST', `${base}/${name}/SaveAs?newfilename=${out}`, token, pdfOpts, 'application/json');
+    if (r.status !== 200) throw new Error(`Aspose saveas ${r.status}: ${r.body.toString().slice(0,200)}`);
+    r = await asposeRequest('GET', `${base}/storage/file/${out}`, token, null);
+    if (r.status !== 200 || r.body.slice(0, 4).toString() !== '%PDF')
+      throw new Error(`Aspose download ${r.status}: ${r.body.toString().slice(0,200)}`);
     return r.body;
   } finally {
     asposeRequest('DELETE', `${base}/storage/file/${name}`, token, null).catch(() => {});
+    asposeRequest('DELETE', `${base}/storage/file/${out}`,  token, null).catch(() => {});
   }
 }
 
@@ -304,6 +316,38 @@ async function readCells(xlsxBuffer, refs) {
   return result;
 }
 
+// Nombre de columna a partir de su número (1=A, 13=M, 27=AA...).
+const _colName = n => { let s = ''; while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; };
+
+// Lee un valor numérico de una celda concreta de un XML de hoja ya cargado.
+function _readNumFromSheet(sheetXml, ref) {
+  const m = sheetXml.match(new RegExp(`<c r="${ref}"[^>]*>(?:<f[^>]*>[\\s\\S]*?<\\/f>)?<v>([\\s\\S]*?)<\\/v>`));
+  return m ? parseFloat(m[1]) : NaN;
+}
+
+// Congela como CONSTANTES las celdas de la curva (filas 118-130 × cols M:AJ de
+// "Datos partida") usando los valores ya calculados por LibreOffice. Al quedar sin
+// fórmula, el calculateformula de Aspose no las puede recalcular a 0 → la curva se dibuja.
+const CURVA_FILAS = [118, 119, 120, 123, 124, 127, 130];
+const CURVA_COLS  = (() => { const a = []; for (let n = 13; n <= 36; n++) a.push(_colName(n)); return a; })(); // M..AJ
+async function congelarCurva(zip, recalcedBuffer) {
+  const recZip = await JSZip.loadAsync(recalcedBuffer);
+  const s2rec  = await recZip.file('xl/worksheets/sheet2.xml').async('string'); // Datos partida
+  let s2 = await zip.file('xl/worksheets/sheet2.xml').async('string');
+  let n = 0;
+  for (const row of CURVA_FILAS) {
+    for (const col of CURVA_COLS) {
+      const ref = `${col}${row}`;
+      const val = _readNumFromSheet(s2rec, ref);
+      if (!isFinite(val)) continue;
+      s2 = _setCellNum(s2, ref, val);
+      n++;
+    }
+  }
+  zip.file('xl/worksheets/sheet2.xml', s2);
+  return n;
+}
+
 // Localiza la imagen del MAPA dentro del xlsx (la PNG más grande del dibujo de la
 // hoja Factura). El número de imagen cambia según la plantilla, así que NO se puede
 // asumir image1.png; hay que detectarla.
@@ -371,6 +415,44 @@ app.post('/api/presupuesto-excel', async (req, res) => {
     // Inyectar los datos del formulario en la hoja Factura (celdas de Toño).
     await injectInputs(zip, v);
 
+    // Recalcular con LibreOffice (calcula bien la curva) y CONGELAR sus celdas como
+    // constantes. Así Aspose, al hacer calculateformula, no puede recalcularlas a 0
+    // → la curva CONSUMO/PRODUCCIÓN se dibuja (Aspose ignora la numCache y recomputa).
+    try {
+      let wbInj = await zip.file('xl/workbook.xml').async('string');
+      wbInj = wbInj.replace(/<calcPr([^>]*)\/>/, (m, a) =>
+        /fullCalcOnLoad/.test(a) ? m : `<calcPr${a} fullCalcOnLoad="1"/>`);
+      zip.file('xl/workbook.xml', wbInj);
+      const injectedBuf = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+      const recalcDir = path.join(tmpDir, `recalc_${ts}`);
+      fs.mkdirSync(recalcDir, { recursive: true });
+      const recalcIn = path.join(tmpDir, `recalc_${ts}.xlsx`);
+      const recalcedBuf = recalcXlsx(injectedBuf, recalcIn, recalcDir);
+      const nCong = await congelarCurva(zip, recalcedBuf);
+      console.log('[CURVA] celdas congeladas:', nCong);
+      fs.unlink(recalcIn, () => {});
+      fs.rm(recalcDir, { recursive: true, force: true }, () => {});
+    } catch (curvaErr) {
+      console.warn('[CURVA] No se pudo congelar la curva (sigue sin ella):', curvaErr.message);
+    }
+
+    // Aspose interpreta fitToWidth="0" como "encajar TODO en 1 página" y comprime las
+    // 3 hojas en una. Excel/LibreOffice lo ignoran (no hay fitToPage). Lo quitamos para
+    // que Aspose pagine por el scale (73%) → 3 páginas A4 como el diseño de Toño.
+    {
+      let s1 = await zip.file('xl/worksheets/sheet1.xml').async('string');
+      s1 = s1.replace(/<pageSetup\b[^>]*\/>/, (tag) =>
+        tag.replace(/\s+fitToWidth="\d+"/g, '').replace(/\s+fitToHeight="\d+"/g, ''));
+      zip.file('xl/worksheets/sheet1.xml', s1);
+
+      // Recortar el área de impresión (J194 → J166): la imagen del mapa termina en la
+      // fila 166; las filas 167-194 son vacías y crean el hueco blanco bajo el mapa.
+      // (NO recortar por debajo de 166 o se aplasta/corta el mapa.)
+      let wbA = await zip.file('xl/workbook.xml').async('string');
+      wbA = wbA.replace(/Factura!\$A\$1:\$J\$194/, () => 'Factura!$A$1:$J$166');
+      zip.file('xl/workbook.xml', wbA);
+    }
+
     // Ocultar hojas auxiliares (se necesitan para los cálculos, pero no deben
     // imprimirse). Robusto: con o sin atributo state previo.
     let wbXml = await zip.file('xl/workbook.xml').async('string');
@@ -411,11 +493,15 @@ app.post('/api/presupuesto-excel', async (req, res) => {
     let pdfBytes;
     if (useAspose) {
       console.log('[PDF] Convirtiendo con Aspose (recálculo + gráficos fieles)...');
+      // Si Aspose está configurado y falla, NO servimos el PDF feo de LibreOffice (mala
+      // imagen para el cliente): devolvemos error para que reintente. El respaldo
+      // LibreOffice solo se usa cuando Aspose NO está configurado (entorno local/dev).
       try {
         pdfBytes = await convertWithAspose(xlsxBuf, process.env.ASPOSE_CLIENT_ID, process.env.ASPOSE_CLIENT_SECRET);
       } catch (aspErr) {
-        console.error('[PDF] Aspose falló, respaldo LibreOffice:', aspErr.message);
-        pdfBytes = xlsxToPdf(await degradeChartsToSolid(xlsxBuf), tmpXlsx, tmpPdf);
+        console.error('[PDF] Aspose falló:', aspErr.message);
+        if (!res.headersSent) res.status(502).json({ error: 'El generador de PDF no está disponible ahora mismo. Inténtalo de nuevo en unos minutos.' });
+        return;
       }
     } else {
       console.log('[PDF] Convirtiendo con LibreOffice...');
@@ -494,4 +580,8 @@ app.post('/api/calcular', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Microservicio PDF en puerto ${PORT}`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Microservicio PDF en puerto ${PORT}`));
+}
+
+module.exports = { recalcXlsx, congelarCurva, _readNumFromSheet, CURVA_FILAS, CURVA_COLS, normalizeInputs, injectInputs };
